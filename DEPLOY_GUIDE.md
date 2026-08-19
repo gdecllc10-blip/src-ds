@@ -73,7 +73,7 @@ whatever keys they want in the sidebar — not great). Restrict it:
 1. From your app's page on share.streamlit.io, open its settings (⋮ menu →
    **Settings** → **Sharing**).
 2. Under viewer access, switch it to restrict by email, and add your own
-   email (gdecllc10@gmail.com) to the allow-list.
+ 
 3. Now only someone signed in as you can open the app.
 
 ## Step 7 — Use it
