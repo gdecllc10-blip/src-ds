@@ -19,16 +19,23 @@ def fake_keepa_product(upc: str, cost: float) -> dict:
     # bias sell price around cost * a markup factor so results feel realistic
     markup = rnd.uniform(1.4, 3.2)
     price = round((cost or rnd.uniform(5, 40)) * markup, 2)
+    # occasionally simulate a low-demand item (rank > 500k) and an
+    # occasional hazmat flag, so the qualifier filters have something to do
+    is_low_demand = rnd.random() < 0.2
+    sales_rank = rnd.randint(500_001, 900_000) if is_low_demand else rnd.randint(500, 300000)
+    is_hazmat = rnd.random() < 0.08
     return {
         "asin": f"B0{rnd.randint(10**7, 10**8 - 1)}",
         "title": f"Demo Product {upc[-4:]}",
         "current_price": price,
-        "sales_rank": rnd.randint(500, 300000),
+        "sales_rank": sales_rank,
         "category": rnd.choice(CATEGORIES),
         "fba_pick_pack_fee": round(rnd.uniform(3.5, 8.5), 2),
         "referral_fee_pct": rnd.choice([0.08, 0.15, 0.15, 0.15, 0.17]),
         "offer_count_new": rnd.randint(1, 25),
         "amazon_is_seller": rnd.random() < 0.3,
+        "hazmat": is_hazmat,
+        "hazmat_detail": rnd.choice(["AEROSOLS", "FLAMMABLE LIQUID", "LITHIUM BATTERY"]) if is_hazmat else None,
     }
 
 
@@ -37,8 +44,8 @@ def fake_ebay_comp(upc: str, cost: float) -> dict:
     markup = rnd.uniform(1.2, 2.6)
     median = round((cost or rnd.uniform(5, 40)) * markup, 2)
     return {
-        "ebay_median_price": median,
-        "ebay_low_price": round(median * 0.85, 2),
+        "ebay_active_median_price": median,
+        "ebay_active_low_price": round(median * 0.85, 2),
         "ebay_active_listings": rnd.randint(1, 40),
     }
 

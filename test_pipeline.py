@@ -5,7 +5,7 @@ Run: python3 test_pipeline.py
 """
 import pandas as pd
 from sheet_parser import load_sheet, detect_columns, clean_upc, clean_cost
-from roi import FeeAssumptions, amazon_roi, ebay_roi, walmart_roi, best_channel
+from roi import FeeAssumptions, amazon_roi, amazon_disqualify_reason, ebay_roi, walmart_roi, best_channel
 import demo_data
 
 
@@ -27,19 +27,26 @@ def main():
     assert len(work) == 15, f"Expected 15 valid rows, got {len(work)}"
     assert all(len(u) >= 8 for u in work["upc"]), "Some UPCs look malformed after cleaning"
 
-    fees = FeeAssumptions()
+    fees = FeeAssumptions()  # rank cap 500k, hazmat exclusion on, eBay haircut 15% - all defaults
     results = []
+    disqualified_count = 0
     for _, r in work.iterrows():
         kp = demo_data.fake_keepa_product(r["upc"], r["cost"])
         eb = demo_data.fake_ebay_comp(r["upc"], r["cost"])
         wm = demo_data.fake_walmart_match(r["upc"], r["cost"])
         az_roi = amazon_roi(r["cost"], kp, fees)
+        reason = amazon_disqualify_reason(kp, fees)
+        if reason:
+            disqualified_count += 1
+            assert az_roi is None, "amazon_roi should return None when disqualified"
         eb_roi = ebay_roi(r["cost"], eb, fees)
         wm_roi = walmart_roi(r["cost"], wm, fees)
         channel, roi_pct = best_channel(az_roi, eb_roi, wm_roi)
         results.append({
             "upc": r["upc"], "desc": r["description"], "cost": r["cost"],
-            "amazon_roi": az_roi["roi_pct"], "ebay_roi": eb_roi["roi_pct"],
+            "rank": kp["sales_rank"], "hazmat": kp["hazmat"], "disqualified": reason,
+            "amazon_roi": az_roi["roi_pct"] if az_roi else None,
+            "ebay_roi": eb_roi["roi_pct"] if eb_roi else None,
             "walmart_roi": wm_roi["roi_pct"] if wm_roi else None,
             "best_channel": channel, "best_roi": roi_pct,
         })
@@ -49,9 +56,14 @@ def main():
 
     meets_30 = (out["best_roi"] >= 30).sum()
     print(f"\n{meets_30} of {len(out)} demo products clear a 30% ROI threshold.")
+    print(f"{disqualified_count} of {len(out)} disqualified on the Amazon channel (rank cap / hazmat).")
 
-    assert out["amazon_roi"].notna().all(), "Amazon ROI missing for some rows"
+    # sanity: every disqualified row has amazon_roi blank, and eBay ROI now reflects
+    # the haircut'd estimated-sold price rather than the raw active price
+    assert out.loc[out["disqualified"].notna(), "amazon_roi"].isna().all(), \
+        "A disqualified row still has an Amazon ROI value"
     assert out["ebay_roi"].notna().all(), "eBay ROI missing for some rows"
+    assert disqualified_count > 0, "Expected at least one demo product to hit a qualifier (rank/hazmat) - check demo_data odds"
     print("\nAll smoke-test assertions passed.")
 
 

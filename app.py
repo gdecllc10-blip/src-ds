@@ -5,7 +5,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from sheet_parser import load_sheet, detect_columns, clean_upc, clean_cost
-from roi import FeeAssumptions, amazon_roi, ebay_roi, walmart_roi, best_channel
+from roi import FeeAssumptions, amazon_roi, amazon_disqualify_reason, ebay_roi, walmart_roi, best_channel
 import demo_data
 import keepa_client
 import ebay_client
@@ -69,17 +69,39 @@ with st.sidebar:
         help="Walmart referral fees vary widely by category (roughly 6-20%) - set this closer to your typical category if you know it.",
     ) / 100.0
     walmart_fulfillment_fallback = st.number_input("Walmart fulfillment fee fallback ($)", value=5.00, step=0.25)
+    ebay_haircut = st.number_input(
+        "eBay active-to-sold price haircut %", value=15.0, step=1.0,
+        help="eBay's real sold-price API (Marketplace Insights) is locked to approved partners - "
+             "not generally available to independent developers. This discounts the active asking "
+             "price to roughly approximate what it'd realistically sell for. See README.",
+    ) / 100.0
+
+    st.divider()
+    st.header("Amazon qualifiers")
+    use_rank_cap = st.checkbox("Require Amazon sales rank under a cutoff", value=True)
+    max_sales_rank = st.number_input(
+        "Max Amazon sales rank to qualify", value=500_000, step=10_000, min_value=1,
+        disabled=not use_rank_cap,
+        help="Products with no rank data, or a rank worse (higher) than this, are excluded from the Amazon channel.",
+    )
+    exclude_hazmat = st.checkbox(
+        "Exclude Amazon hazmat / dangerous goods items", value=True,
+        help="Uses Keepa's hazardousMaterials flag (aerosols, flammables, lithium batteries, etc).",
+    )
 
     fees = FeeAssumptions(
         amazon_referral_fallback_pct=referral_fallback,
         amazon_fulfillment_fallback=fulfillment_fallback,
         ebay_fee_pct=ebay_fee_pct,
         ebay_shipping_estimate=ebay_shipping,
+        ebay_active_to_sold_haircut_pct=ebay_haircut,
         walmart_referral_fallback_pct=walmart_referral_fallback,
         walmart_fulfillment_fallback=walmart_fulfillment_fallback,
+        amazon_max_sales_rank=int(max_sales_rank) if use_rank_cap else None,
+        amazon_exclude_hazmat=exclude_hazmat,
     )
 
-    check_ebay = st.checkbox("Also check eBay comps", value=False)
+    check_ebay = st.checkbox("Also check eBay comps (active US listings, not sold)", value=False)
     check_walmart = st.checkbox(
         "Also check Walmart catalog match (approved sellers)", value=False,
         help="Uses Walmart's official Item Search API to see if the item exists on Walmart.com. "
@@ -198,6 +220,7 @@ for _, r in work.iterrows():
     kp_list = keepa_results.get(u) or []
     kp = kp_list[0] if kp_list else None
     az = amazon_roi(cost, kp, fees)
+    az_disqualified = amazon_disqualify_reason(kp, fees)
     eb = ebay_roi(cost, ebay_results.get(u), fees) if check_ebay else None
     wm = walmart_roi(cost, walmart_results.get(u), fees) if check_walmart else None
     channel, channel_roi = best_channel(az, eb, wm)
@@ -212,7 +235,9 @@ for _, r in work.iterrows():
         "Amazon Sales Rank": kp.get("sales_rank") if kp else None,
         "Amazon ROI %": az["roi_pct"] if az else None,
         "Amazon Net Profit": az["net_profit"] if az else None,
-        "eBay Price": eb["sell_price"] if eb else None,
+        "Amazon Disqualified": az_disqualified,
+        "eBay Active Price": eb["active_price"] if eb else None,
+        "eBay Est. Sold Price": eb["sell_price"] if eb else None,
         "eBay ROI %": eb["roi_pct"] if eb else None,
         "Walmart Match": bool(walmart_results.get(u)) if check_walmart else None,
         "Walmart Price": wm["sell_price"] if wm else None,
@@ -238,12 +263,26 @@ display_df = results[results["Meets Threshold"]] if only_buys else results
 st.dataframe(
     display_df.style.format({
         "Cost": "${:.2f}", "Amazon Price": "${:.2f}", "Amazon Net Profit": "${:.2f}",
-        "eBay Price": "${:.2f}", "Walmart Price": "${:.2f}",
+        "eBay Active Price": "${:.2f}", "eBay Est. Sold Price": "${:.2f}", "Walmart Price": "${:.2f}",
         "Amazon ROI %": "{:.1f}%", "eBay ROI %": "{:.1f}%", "Walmart ROI %": "{:.1f}%", "Best ROI %": "{:.1f}%",
     }, na_rep="-"),
     use_container_width=True,
     height=500,
 )
+
+n_disqualified = int(results["Amazon Disqualified"].notna().sum())
+if n_disqualified:
+    st.caption(
+        f"{n_disqualified} product(s) were excluded from the Amazon channel by your qualifiers "
+        f"(sales rank cutoff and/or hazmat) - see the 'Amazon Disqualified' column for why. "
+        f"They can still qualify via eBay/Walmart if those are checked."
+    )
+
+if check_ebay:
+    st.caption(
+        "eBay 'Est. Sold Price' applies your active-to-sold haircut % to the active asking price - "
+        "it is an estimate, not real sold data (see README for why)."
+    )
 
 if check_walmart:
     st.caption(

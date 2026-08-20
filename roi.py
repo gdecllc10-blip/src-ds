@@ -12,7 +12,12 @@ Amazon:
     roi             = net_profit / cost
 
 eBay:
-    revenue        = median active-listing comp price
+    revenue        = median ACTIVE US-listing comp price, minus a haircut %
+                      to approximate a realized sold price (eBay's real sold
+                      data requires Marketplace Insights API access, which is
+                      limited-release and generally not grantable to small
+                      developers right now - see ebay_client.py). Treat this
+                      as an estimate, not a real sold comp.
     final_value_fee = revenue * ebay_fee_pct + fixed_fee
     net_profit      = revenue - cost - final_value_fee - shipping_estimate
     roi             = net_profit / cost
@@ -42,12 +47,36 @@ class FeeAssumptions:
     ebay_fee_pct: float = 0.1325
     ebay_fixed_fee: float = 0.30
     ebay_shipping_estimate: float = 6.00
+    ebay_active_to_sold_haircut_pct: float = 0.15
     walmart_referral_fallback_pct: float = 0.12
     walmart_fulfillment_fallback: float = 5.00
+    amazon_max_sales_rank: int | None = 500_000
+    amazon_exclude_hazmat: bool = True
+
+
+def amazon_disqualify_reason(keepa_data: dict | None, fees: FeeAssumptions) -> str | None:
+    """
+    Returns a short reason string if this product should be disqualified from
+    the Amazon channel regardless of ROI (too little demand signal, or a
+    dangerous-goods/hazmat listing), else None.
+    """
+    if not keepa_data:
+        return None
+    if fees.amazon_exclude_hazmat and keepa_data.get("hazmat"):
+        return "Hazmat / dangerous goods"
+    if fees.amazon_max_sales_rank is not None:
+        rank = keepa_data.get("sales_rank")
+        if rank is None:
+            return "No sales rank data"
+        if rank > fees.amazon_max_sales_rank:
+            return f"Sales rank {rank:,} exceeds {fees.amazon_max_sales_rank:,} cutoff"
+    return None
 
 
 def amazon_roi(cost: float, keepa_data: dict | None, fees: FeeAssumptions):
     if not keepa_data or keepa_data.get("current_price") is None or not cost:
+        return None
+    if amazon_disqualify_reason(keepa_data, fees):
         return None
     price = keepa_data["current_price"]
     referral_pct = keepa_data.get("referral_fee_pct") or fees.amazon_referral_fallback_pct
@@ -65,14 +94,16 @@ def amazon_roi(cost: float, keepa_data: dict | None, fees: FeeAssumptions):
 
 
 def ebay_roi(cost: float, ebay_data: dict | None, fees: FeeAssumptions):
-    if not ebay_data or ebay_data.get("ebay_median_price") is None or not cost:
+    if not ebay_data or ebay_data.get("ebay_active_median_price") is None or not cost:
         return None
-    price = ebay_data["ebay_median_price"]
-    fvf = price * fees.ebay_fee_pct + fees.ebay_fixed_fee
-    net_profit = price - cost - fvf - fees.ebay_shipping_estimate
+    active_price = ebay_data["ebay_active_median_price"]
+    estimated_sold_price = active_price * (1 - fees.ebay_active_to_sold_haircut_pct)
+    fvf = estimated_sold_price * fees.ebay_fee_pct + fees.ebay_fixed_fee
+    net_profit = estimated_sold_price - cost - fvf - fees.ebay_shipping_estimate
     roi = net_profit / cost if cost else None
     return {
-        "sell_price": round(price, 2),
+        "active_price": round(active_price, 2),
+        "sell_price": round(estimated_sold_price, 2),
         "final_value_fee": round(fvf, 2),
         "net_profit": round(net_profit, 2),
         "roi_pct": round(roi * 100, 1) if roi is not None else None,

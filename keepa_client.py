@@ -109,6 +109,14 @@ def _parse_product(p: dict) -> dict:
     if ref_fee_pct:
         referral_pct = ref_fee_pct / 100.0
 
+    # Keepa reports hazmat/dangerous-goods classification as a
+    # "hazardousMaterials" array (e.g. [{"aspect": "proper_shipping_name",
+    # "value": "AEROSOLS"}]) when Amazon has flagged the product.
+    hazmat_list = p.get("hazardousMaterials") or []
+    hazmat_summary = ", ".join(
+        str(h.get("value")) for h in hazmat_list if isinstance(h, dict) and h.get("value")
+    ) or None
+
     return {
         "asin": p.get("asin"),
         "title": p.get("title"),
@@ -119,4 +127,6 @@ def _parse_product(p: dict) -> dict:
         "referral_fee_pct": referral_pct,
         "offer_count_new": p.get("offerCountNew"),
         "amazon_is_seller": (p.get("availabilityAmazon", -1) not in (-1, None)),
+        "hazmat": bool(hazmat_list),
+        "hazmat_detail": hazmat_summary,
     }
