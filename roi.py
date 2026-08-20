@@ -57,8 +57,16 @@ class FeeAssumptions:
 def amazon_disqualify_reason(keepa_data: dict | None, fees: FeeAssumptions) -> str | None:
     """
     Returns a short reason string if this product should be disqualified from
-    the Amazon channel regardless of ROI (too little demand signal, or a
-    dangerous-goods/hazmat listing), else None.
+    the Amazon channel regardless of ROI (a dangerous-goods/hazmat listing,
+    or a confirmed sales rank worse than your cutoff), else None.
+
+    Important: the rank cutoff only applies when Keepa actually reports a
+    rank. No Amazon match at all, or a match with no rank data, is treated
+    as "unknown," not "fails the check" - it does NOT disqualify the
+    product. That way a product with no Amazon listing (or no rank signal)
+    still flows through normally and can surface via eBay/Walmart if it
+    clears ROI there; the "Amazon Sales Rank" column will just show blank
+    so you know the rank simply isn't known, not that it failed a rule.
     """
     if not keepa_data:
         return None
@@ -66,9 +74,7 @@ def amazon_disqualify_reason(keepa_data: dict | None, fees: FeeAssumptions) -> s
         return "Hazmat / dangerous goods"
     if fees.amazon_max_sales_rank is not None:
         rank = keepa_data.get("sales_rank")
-        if rank is None:
-            return "No sales rank data"
-        if rank > fees.amazon_max_sales_rank:
+        if rank is not None and rank > fees.amazon_max_sales_rank:
             return f"Sales rank {rank:,} exceeds {fees.amazon_max_sales_rank:,} cutoff"
     return None
 

@@ -82,7 +82,9 @@ with st.sidebar:
     max_sales_rank = st.number_input(
         "Max Amazon sales rank to qualify", value=500_000, step=10_000, min_value=1,
         disabled=not use_rank_cap,
-        help="Products with no rank data, or a rank worse (higher) than this, are excluded from the Amazon channel.",
+        help="Only applies when Keepa actually reports a rank over this cutoff. No Amazon match, or a "
+             "match with no rank data, is treated as unknown - NOT disqualified - so it can still "
+             "surface via eBay/Walmart.",
     )
     exclude_hazmat = st.checkbox(
         "Exclude Amazon hazmat / dangerous goods items", value=True,
@@ -178,7 +180,8 @@ keepa_results = {}
 if demo_mode or not keepa_key:
     for u in upcs:
         row = work.loc[work["upc"] == u].iloc[0]
-        keepa_results[u] = [demo_data.fake_keepa_product(u, row["cost"])]
+        kp = demo_data.fake_keepa_product(u, row["cost"])
+        keepa_results[u] = [kp] if kp else []  # empty list = "no Amazon match", same shape Keepa returns
 else:
     try:
         keepa_results = keepa_client.fetch_products_by_upc(keepa_key, upcs)

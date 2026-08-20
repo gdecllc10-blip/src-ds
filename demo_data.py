@@ -14,15 +14,29 @@ def _seeded_random(upc: str) -> random.Random:
     return random.Random(seed)
 
 
-def fake_keepa_product(upc: str, cost: float) -> dict:
+def fake_keepa_product(upc: str, cost: float) -> dict | None:
     rnd = _seeded_random(upc)
+
+    # ~10% of demo products simulate "not sold on Amazon at all" - Keepa
+    # returns no match for the UPC. Proves the app doesn't block eBay/Walmart
+    # results just because Amazon has nothing.
+    if rnd.random() < 0.10:
+        return None
+
     # bias sell price around cost * a markup factor so results feel realistic
     markup = rnd.uniform(1.4, 3.2)
     price = round((cost or rnd.uniform(5, 40)) * markup, 2)
-    # occasionally simulate a low-demand item (rank > 500k) and an
-    # occasional hazmat flag, so the qualifier filters have something to do
-    is_low_demand = rnd.random() < 0.2
-    sales_rank = rnd.randint(500_001, 900_000) if is_low_demand else rnd.randint(500, 300000)
+
+    # ~10% simulate a matched product with no rank data available (Keepa
+    # sometimes just doesn't have current rank history) - this should NOT
+    # disqualify the product, only an explicit rank over the cutoff should.
+    has_rank = rnd.random() >= 0.10
+    if not has_rank:
+        sales_rank = None
+    else:
+        is_low_demand = rnd.random() < 0.2
+        sales_rank = rnd.randint(500_001, 900_000) if is_low_demand else rnd.randint(500, 300000)
+
     is_hazmat = rnd.random() < 0.08
     return {
         "asin": f"B0{rnd.randint(10**7, 10**8 - 1)}",
