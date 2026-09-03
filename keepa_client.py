@@ -46,6 +46,13 @@ API changes - third-party API surfaces do drift over time):
   windows, indexed the same way as `csv` (so `stats.avg90[18]` is the
   90-day average Buy Box price). We use this to flag when today's price is
   unusually high vs its own recent history.
+- Passing `rating=1` (which we now also do) makes Keepa include existing
+  RATING (csv index 16, stored as rating*10 - 45 means 4.5 stars) and
+  COUNT_REVIEWS (csv index 17) history *if Keepa already has it on file* -
+  it does NOT force a live re-check of Amazon. Costs at most +1 extra token
+  per product (only charged if Keepa's data for those two fields is more
+  than 14 days stale and needs refreshing), far cheaper than the +6/page
+  cost of requesting live `offers` data, which we don't use.
 """
 from __future__ import annotations
 import time
@@ -82,7 +89,7 @@ def _last_valid(csv_series):
 def _fetch_one(session: requests.Session, api_key: str, upc: str, domain: int) -> list:
     """Fetch and parse the product(s) matching exactly one UPC. Raises KeepaError on
     a hard failure (bad key, etc). Retries transient/rate-limit errors a few times."""
-    params = {"key": api_key, "domain": domain, "code": upc, "stats": 1}
+    params = {"key": api_key, "domain": domain, "code": upc, "stats": 1, "rating": 1}
     last_error = None
 
     for attempt in range(MAX_RETRIES_PER_UPC):
@@ -159,6 +166,8 @@ def _parse_product(p: dict) -> dict:
     amazon_series = csv[0] if len(csv) > 0 else None
     rank_series = csv[3] if len(csv) > 3 else None
     new_series = csv[1] if len(csv) > 1 else None
+    rating_series = csv[16] if len(csv) > 16 else None
+    review_count_series = csv[17] if len(csv) > 17 else None
 
     current_price = (
         _cents_to_dollars(_last_valid(buybox_series))
@@ -166,6 +175,10 @@ def _parse_product(p: dict) -> dict:
         or _cents_to_dollars(_last_valid(amazon_series))
     )
     sales_rank = _last_valid(rank_series)
+
+    raw_rating = _last_valid(rating_series)  # stored as rating*10 (45 = 4.5 stars)
+    rating = round(raw_rating / 10.0, 1) if raw_rating is not None else None
+    review_count = _last_valid(review_count_series)
 
     # 90-day average price, preferring the same series current_price came
     # from (Buy Box), falling back to New if Buy Box has no average on file.
@@ -212,4 +225,6 @@ def _parse_product(p: dict) -> dict:
         "hazmat_detail": hazmat_summary,
         "price_avg_90": price_avg_90,
         "price_vs_avg90_pct": price_vs_avg90_pct,
+        "rating": rating,
+        "review_count": review_count,
     }

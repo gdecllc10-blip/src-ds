@@ -96,6 +96,16 @@ with st.sidebar:
              "price looks like a temporary spike rather than the normal going rate, since ROI calculated "
              "against a spike price often disappears once the price reverts.",
     )
+    min_rating_flag = st.number_input(
+        "Flag rating below (stars)", value=3.5, step=0.1, min_value=1.0, max_value=5.0,
+        help="Informational only - doesn't disqualify anything. Flags products with a low star rating, "
+             "or with no rating data at all (too new/low-volume to have one), so you notice before buying.",
+    )
+    min_reviews_flag = st.number_input(
+        "Flag review count below", value=10, step=5, min_value=0,
+        help="A high star rating built on very few reviews isn't a reliable signal - flags products "
+             "under this review count alongside the rating flag.",
+    )
 
     fees = FeeAssumptions(
         amazon_referral_fallback_pct=referral_fallback,
@@ -248,6 +258,11 @@ for _, r in work.iterrows():
     amazon_sells_it = kp.get("amazon_is_seller") if kp else None
     price_vs_avg = kp.get("price_vs_avg90_pct") if kp else None
     is_price_spike = (price_vs_avg is not None and price_vs_avg >= spike_threshold)
+    rating = kp.get("rating") if kp else None
+    review_count = kp.get("review_count") if kp else None
+    rating_concern = kp is not None and (
+        rating is None or rating < min_rating_flag or (review_count or 0) < min_reviews_flag
+    )
 
     rows.append({
         "UPC": u,
@@ -262,6 +277,9 @@ for _, r in work.iterrows():
         "Amazon Sells This?": ("Yes" if amazon_sells_it else ("No" if amazon_sells_it is not None else None)),
         "Price vs 90-Day Avg %": price_vs_avg,
         "Price Spike?": ("Yes" if is_price_spike else ("No" if price_vs_avg is not None else None)),
+        "Amazon Rating": rating,
+        "Amazon Reviews": review_count,
+        "Rating Concern?": ("Yes" if rating_concern else ("No" if kp is not None else None)),
         "Amazon ROI %": az["roi_pct"] if az else None,
         "Amazon Net Profit": az["net_profit"] if az else None,
         "Amazon Disqualified": az_disqualified,
@@ -312,6 +330,8 @@ def _highlight_flags(row):
         styles[list(row.index).index("Amazon Sells This?")] = "background-color: #ffe9e0"
     if row.get("Price Spike?") == "Yes":
         styles[list(row.index).index("Price Spike?")] = "background-color: #fff3cd"
+    if row.get("Rating Concern?") == "Yes":
+        styles[list(row.index).index("Rating Concern?")] = "background-color: #fff3cd"
     return styles
 
 
@@ -321,6 +341,7 @@ st.dataframe(
         "eBay Active Price": "${:.2f}", "eBay Est. Sold Price": "${:.2f}", "Walmart Price": "${:.2f}",
         "Amazon ROI %": "{:.1f}%", "eBay ROI %": "{:.1f}%", "Walmart ROI %": "{:.1f}%", "Best ROI %": "{:.1f}%",
         "Price vs 90-Day Avg %": "{:+.1f}%",
+        "Amazon Rating": "{:.1f} ★", "Amazon Reviews": "{:,.0f}",
     }, na_rep="-").apply(_highlight_flags, axis=1),
     use_container_width=True,
     height=500,
@@ -347,6 +368,14 @@ if n_spikes:
         f"{n_spikes} product(s) are priced well above their 90-day average (highlighted) - worth "
         f"double-checking the price history on Amazon/Keepa before buying, since ROI calculated "
         f"against a temporary spike often disappears once the price normalizes."
+    )
+
+n_rating_concerns = int((results["Rating Concern?"] == "Yes").sum())
+if n_rating_concerns:
+    st.caption(
+        f"{n_rating_concerns} product(s) have a low rating, too few reviews to trust the rating, or no "
+        f"rating data at all (highlighted) - a great ROI on a poorly-rated listing often means high "
+        f"returns/refunds eating the margin, so worth a manual look before buying."
     )
 
 if check_ebay:
