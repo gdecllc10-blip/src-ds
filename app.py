@@ -90,6 +90,12 @@ with st.sidebar:
         "Exclude Amazon hazmat / dangerous goods items", value=True,
         help="Uses Keepa's hazardousMaterials flag (aerosols, flammables, lithium batteries, etc).",
     )
+    spike_threshold = st.number_input(
+        "Flag price if it's this much above its 90-day average (%)", value=25.0, step=5.0,
+        help="Informational only - doesn't disqualify anything. Flags products where today's Amazon "
+             "price looks like a temporary spike rather than the normal going rate, since ROI calculated "
+             "against a spike price often disappears once the price reverts.",
+    )
 
     fees = FeeAssumptions(
         amazon_referral_fallback_pct=referral_fallback,
@@ -184,10 +190,20 @@ if demo_mode or not keepa_key:
         keepa_results[u] = [kp] if kp else []  # empty list = "no Amazon match", same shape Keepa returns
 else:
     try:
-        keepa_results = keepa_client.fetch_products_by_upc(keepa_key, upcs)
+        keepa_results, keepa_errors = keepa_client.fetch_products_by_upc(keepa_key, upcs)
     except keepa_client.KeepaError as e:
         st.error(f"Keepa lookup failed: {e}")
         st.stop()
+    if keepa_errors:
+        with st.expander(f"⚠️ {len(keepa_errors)} UPC(s) failed to look up after retries - click to see which"):
+            st.write(
+                "These are shown as 'no Amazon match' below, but that's not confirmed - "
+                "the lookup itself failed (rate limiting or a transient error), not that "
+                "Amazon doesn't carry them. Worth re-running if this list is large."
+            )
+            st.table(pd.DataFrame(
+                [{"UPC": u, "Error": msg} for u, msg in keepa_errors.items()]
+            ))
 
 progress.progress(0.6, text="Fetching eBay comps..." if check_ebay else "Computing ROI...")
 
@@ -228,14 +244,24 @@ for _, r in work.iterrows():
     wm = walmart_roi(cost, walmart_results.get(u), fees) if check_walmart else None
     channel, channel_roi = best_channel(az, eb, wm)
 
+    offer_count = kp.get("offer_count_new") if kp else None
+    amazon_sells_it = kp.get("amazon_is_seller") if kp else None
+    price_vs_avg = kp.get("price_vs_avg90_pct") if kp else None
+    is_price_spike = (price_vs_avg is not None and price_vs_avg >= spike_threshold)
+
     rows.append({
         "UPC": u,
         "Description": r["description"],
         "Cost": cost,
         "Case Qty": r["case_qty"],
+        "Amazon ASIN": kp.get("asin") if kp else None,
         "Amazon Title": kp.get("title") if kp else None,
         "Amazon Price": az["sell_price"] if az else None,
         "Amazon Sales Rank": kp.get("sales_rank") if kp else None,
+        "Amazon Offers (New)": offer_count,
+        "Amazon Sells This?": ("Yes" if amazon_sells_it else ("No" if amazon_sells_it is not None else None)),
+        "Price vs 90-Day Avg %": price_vs_avg,
+        "Price Spike?": ("Yes" if is_price_spike else ("No" if price_vs_avg is not None else None)),
         "Amazon ROI %": az["roi_pct"] if az else None,
         "Amazon Net Profit": az["net_profit"] if az else None,
         "Amazon Disqualified": az_disqualified,
@@ -256,6 +282,23 @@ progress.empty()
 results = pd.DataFrame(rows)
 results = results.sort_values("Best ROI %", ascending=False, na_position="last")
 
+# Sanity check: the same Amazon ASIN showing up against many different UPCs
+# in one run is a red flag, not a coincidence - it's the exact signature of
+# a UPC-to-product mismatch bug (see keepa_client.py docstring for the one
+# this app used to have). Surface it loudly rather than let bad matches
+# blend into the results quietly.
+asin_counts = results.loc[results["Amazon ASIN"].notna(), "Amazon ASIN"].value_counts()
+suspicious_asins = asin_counts[asin_counts > 3]
+if not suspicious_asins.empty:
+    st.error(
+        f"⚠️ {len(suspicious_asins)} Amazon product(s) are showing up against more than 3 different "
+        f"UPCs in this run - that usually means a mismatch, not a real coincidence. Do not trust "
+        f"the ROI numbers for these rows until you spot-check them on Amazon directly:"
+    )
+    for asin, count in suspicious_asins.items():
+        sample_title = results.loc[results["Amazon ASIN"] == asin, "Amazon Title"].iloc[0]
+        st.write(f"- **{asin}** (\"{sample_title}\") matched to {count} different UPCs")
+
 st.subheader("3. Results")
 n_buys = int(results["Meets Threshold"].sum())
 st.success(f"{n_buys} of {len(results)} products meet your {min_roi}%+ ROI threshold.")
@@ -263,12 +306,22 @@ st.success(f"{n_buys} of {len(results)} products meet your {min_roi}%+ ROI thres
 only_buys = st.checkbox(f"Show only products meeting the {min_roi}% threshold", value=True)
 display_df = results[results["Meets Threshold"]] if only_buys else results
 
+def _highlight_flags(row):
+    styles = [""] * len(row)
+    if row.get("Amazon Sells This?") == "Yes":
+        styles[list(row.index).index("Amazon Sells This?")] = "background-color: #ffe9e0"
+    if row.get("Price Spike?") == "Yes":
+        styles[list(row.index).index("Price Spike?")] = "background-color: #fff3cd"
+    return styles
+
+
 st.dataframe(
     display_df.style.format({
         "Cost": "${:.2f}", "Amazon Price": "${:.2f}", "Amazon Net Profit": "${:.2f}",
         "eBay Active Price": "${:.2f}", "eBay Est. Sold Price": "${:.2f}", "Walmart Price": "${:.2f}",
         "Amazon ROI %": "{:.1f}%", "eBay ROI %": "{:.1f}%", "Walmart ROI %": "{:.1f}%", "Best ROI %": "{:.1f}%",
-    }, na_rep="-"),
+        "Price vs 90-Day Avg %": "{:+.1f}%",
+    }, na_rep="-").apply(_highlight_flags, axis=1),
     use_container_width=True,
     height=500,
 )
@@ -279,6 +332,21 @@ if n_disqualified:
         f"{n_disqualified} product(s) were excluded from the Amazon channel by your qualifiers "
         f"(sales rank cutoff and/or hazmat) - see the 'Amazon Disqualified' column for why. "
         f"They can still qualify via eBay/Walmart if those are checked."
+    )
+
+n_amazon_sells = int((results["Amazon Sells This?"] == "Yes").sum())
+if n_amazon_sells:
+    st.caption(
+        f"{n_amazon_sells} product(s) have Amazon itself as a seller (highlighted) - competing "
+        f"directly against Amazon on the Buy Box is usually a tough spot even when the ROI math looks fine."
+    )
+
+n_spikes = int((results["Price Spike?"] == "Yes").sum())
+if n_spikes:
+    st.caption(
+        f"{n_spikes} product(s) are priced well above their 90-day average (highlighted) - worth "
+        f"double-checking the price history on Amazon/Keepa before buying, since ROI calculated "
+        f"against a temporary spike often disappears once the price normalizes."
     )
 
 if check_ebay:
