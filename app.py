@@ -1,5 +1,8 @@
 import os
 import io
+import math
+import hashlib
+import zipfile
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -178,11 +181,72 @@ work = work[(work["upc"] != "") & work["cost"].notna()].drop_duplicates(subset="
 
 st.caption(f"{len(work)} valid rows with a UPC and cost detected.")
 
-st.subheader("2. Run sourcing analysis")
-run = st.button(f"Analyze {len(work)} products", type="primary")
+# ---------------------------------------------------------------------------
+# Batching - so a sheet with thousands of rows doesn't have to be manually
+# split into separate files beforehand. Batches are tracked per-sheet (keyed
+# off the actual UPC list, not the filename) so re-uploading the same sheet
+# resumes where you left off, and a genuinely different sheet starts fresh.
+# ---------------------------------------------------------------------------
+sheet_id = hashlib.md5(",".join(sorted(work["upc"].tolist())).encode()).hexdigest()[:12]
+if st.session_state.get("sheet_id") != sheet_id:
+    st.session_state["sheet_id"] = sheet_id
+    st.session_state["batch_results"] = {}
+
+st.subheader("2. Batches")
+total_rows = len(work)
+if total_rows > 100:
+    batch_size = int(st.number_input(
+        "Batch size", value=100, min_value=10, max_value=1000, step=10,
+        help="Splits this sheet into chunks of this size so you can run them one at a time "
+             "instead of manually copying rows into separate files. 100 is a reasonable default; "
+             "raise it if your Keepa plan has enough token headroom to comfortably burst that many "
+             "lookups at once (see the token-budget discussion in the README).",
+    ))
+else:
+    batch_size = max(total_rows, 1)
+
+num_batches = max(1, math.ceil(total_rows / batch_size))
+batch_bounds = [(i * batch_size, min((i + 1) * batch_size, total_rows)) for i in range(num_batches)]
+completed_batches = st.session_state["batch_results"]
+
+if num_batches > 1:
+    st.caption(f"This sheet is split into {num_batches} batches of up to {batch_size} rows each.")
+    batch_labels = [
+        f"{'✅ ' if i in completed_batches else ''}Batch {i + 1} of {num_batches} (rows {start + 1}-{end})"
+        for i, (start, end) in enumerate(batch_bounds)
+    ]
+    selected_batch = st.selectbox(
+        "Which batch do you want to run now?", range(num_batches), format_func=lambda i: batch_labels[i],
+    )
+
+    with st.expander("Prefer to pre-split the whole sheet into separate files instead?"):
+        st.write(
+            "Generates one Excel file per batch (just UPC/cost/description/qty - no lookups run "
+            "yet) if you'd rather hand batches off individually or work across multiple sessions."
+        )
+        if st.button("Generate batch files (.zip)"):
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                for i, (start, end) in enumerate(batch_bounds):
+                    excel_buf = io.BytesIO()
+                    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+                        work.iloc[start:end].to_excel(writer, index=False, sheet_name="Batch")
+                    zf.writestr(f"batch_{i + 1:02d}_of_{num_batches}.xlsx", excel_buf.getvalue())
+            st.download_button(
+                "Download batch files (.zip)", data=zip_buf.getvalue(),
+                file_name="distributor_sheet_batches.zip", mime="application/zip",
+            )
+else:
+    selected_batch = 0
+
+start, end = batch_bounds[selected_batch]
+batch_work = work.iloc[start:end].reset_index(drop=True)
+
+st.subheader("3. Run sourcing analysis")
+run = st.button(f"Analyze {len(batch_work)} products (this batch)", type="primary")
 
 if not run:
-    st.dataframe(work, use_container_width=True)
+    st.dataframe(batch_work, use_container_width=True)
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -190,12 +254,12 @@ if not run:
 # ---------------------------------------------------------------------------
 progress = st.progress(0.0, text="Fetching Amazon data...")
 
-upcs = work["upc"].tolist()
+upcs = batch_work["upc"].tolist()
 keepa_results = {}
 
 if demo_mode or not keepa_key:
     for u in upcs:
-        row = work.loc[work["upc"] == u].iloc[0]
+        row = batch_work.loc[batch_work["upc"] == u].iloc[0]
         kp = demo_data.fake_keepa_product(u, row["cost"])
         keepa_results[u] = [kp] if kp else []  # empty list = "no Amazon match", same shape Keepa returns
 else:
@@ -221,7 +285,7 @@ ebay_results = {}
 if check_ebay:
     if demo_mode or not (ebay_app_id and ebay_cert_id):
         for u in upcs:
-            row = work.loc[work["upc"] == u].iloc[0]
+            row = batch_work.loc[batch_work["upc"] == u].iloc[0]
             ebay_results[u] = demo_data.fake_ebay_comp(u, row["cost"])
     else:
         for u in upcs:
@@ -235,7 +299,7 @@ if check_walmart:
     progress.progress(0.75, text="Checking Walmart catalog matches...")
     if demo_mode or not (walmart_client_id and walmart_client_secret):
         for u in upcs:
-            row = work.loc[work["upc"] == u].iloc[0]
+            row = batch_work.loc[batch_work["upc"] == u].iloc[0]
             walmart_results[u] = demo_data.fake_walmart_match(u, row["cost"])
     else:
         for u in upcs:
@@ -244,7 +308,7 @@ if check_walmart:
 progress.progress(0.9, text="Computing ROI...")
 
 rows = []
-for _, r in work.iterrows():
+for _, r in batch_work.iterrows():
     u, cost = r["upc"], r["cost"]
     kp_list = keepa_results.get(u) or []
     kp = kp_list[0] if kp_list else None
@@ -299,6 +363,11 @@ progress.empty()
 
 results = pd.DataFrame(rows)
 results = results.sort_values("Best ROI %", ascending=False, na_position="last")
+results.insert(0, "Batch", selected_batch + 1)
+
+# remember this batch's results for the session so a "combined so far"
+# export is possible once you've run more than one batch from this sheet
+st.session_state["batch_results"][selected_batch] = results
 
 # Sanity check: the same Amazon ASIN showing up against many different UPCs
 # in one run is a red flag, not a coincidence - it's the exact signature of
@@ -317,7 +386,7 @@ if not suspicious_asins.empty:
         sample_title = results.loc[results["Amazon ASIN"] == asin, "Amazon Title"].iloc[0]
         st.write(f"- **{asin}** (\"{sample_title}\") matched to {count} different UPCs")
 
-st.subheader("3. Results")
+st.subheader("4. Results")
 n_buys = int(results["Meets Threshold"].sum())
 st.success(f"{n_buys} of {len(results)} products meet your {min_roi}%+ ROI threshold.")
 
@@ -394,11 +463,35 @@ buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as writer:
     results.to_excel(writer, index=False, sheet_name="ROI Results")
 st.download_button(
-    "Download full results as Excel",
+    f"Download this batch's results as Excel" if num_batches > 1 else "Download full results as Excel",
     data=buf.getvalue(),
-    file_name="sourcing_roi_results.xlsx",
+    file_name=f"sourcing_roi_results_batch{selected_batch + 1}.xlsx" if num_batches > 1 else "sourcing_roi_results.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+
+if num_batches > 1:
+    st.subheader("5. Combined results across batches")
+    n_completed = len(st.session_state["batch_results"])
+    st.caption(f"{n_completed} of {num_batches} batches analyzed so far this session.")
+    if n_completed > 1:
+        combined = pd.concat(st.session_state["batch_results"].values(), ignore_index=True)
+        combined = combined.sort_values("Best ROI %", ascending=False, na_position="last")
+        combined_buf = io.BytesIO()
+        with pd.ExcelWriter(combined_buf, engine="openpyxl") as writer:
+            combined.to_excel(writer, index=False, sheet_name="ROI Results (Combined)")
+        st.download_button(
+            f"Download combined results ({n_completed} batches, {len(combined)} products)",
+            data=combined_buf.getvalue(),
+            file_name="sourcing_roi_results_combined.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        if n_completed < num_batches:
+            st.caption(
+                f"{num_batches - n_completed} batch(es) not run yet - pick them from the batch selector "
+                f"above and analyze each, then re-download the combined file to include everything."
+            )
+    else:
+        st.caption("Run at least one more batch to unlock a combined download across all of them.")
 
 if demo_mode or not keepa_key:
     st.warning(
