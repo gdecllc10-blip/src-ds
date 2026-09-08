@@ -86,10 +86,17 @@ def _last_valid(csv_series):
     return None
 
 
-def _fetch_one(session: requests.Session, api_key: str, upc: str, domain: int) -> list:
+def _fetch_one(
+    session: requests.Session, api_key: str, upc: str, domain: int, include_rating: bool, code_limit: int
+) -> list:
     """Fetch and parse the product(s) matching exactly one UPC. Raises KeepaError on
     a hard failure (bad key, etc). Retries transient/rate-limit errors a few times."""
-    params = {"key": api_key, "domain": domain, "code": upc, "stats": 1, "rating": 1}
+    params = {"key": api_key, "domain": domain, "code": upc, "stats": 1, "code-limit": code_limit}
+    if include_rating:
+        # Costs up to +1 extra token per product (only when Keepa's cached
+        # rating/review data is >14 days stale and needs a refresh) - opt-in
+        # since it roughly doubles worst-case cost on a large batch.
+        params["rating"] = 1
     last_error = None
 
     for attempt in range(MAX_RETRIES_PER_UPC):
@@ -121,12 +128,41 @@ def _fetch_one(session: requests.Session, api_key: str, upc: str, domain: int) -
     raise KeepaError(f"Keepa lookup failed for UPC {upc} after {MAX_RETRIES_PER_UPC} attempts: {last_error}")
 
 
-def fetch_products_by_upc(api_key: str, upcs: list[str], domain: int = AMAZON_DOMAIN_US) -> tuple[dict, dict]:
+def fetch_products_by_upc(
+    api_key: str,
+    upcs: list[str],
+    domain: int = AMAZON_DOMAIN_US,
+    include_rating: bool = False,
+    code_limit: int = 3,
+) -> tuple[dict, dict]:
     """
     Look up each UPC against Keepa individually (see module docstring for why).
+
+    include_rating=True adds Keepa's rating/review-count data (see _fetch_one)
+    at the cost of up to +1 extra token per product - defaults to False so
+    routine runs stay at the base ~1 token/product cost; turn it on when you
+    specifically want ratings for a batch.
+
+    code_limit caps how many products Keepa will return for a single UPC.
+    THIS IS THE MAIN TOKEN-COST LEVER, more impactful than include_rating:
+    Keepa bills 1 token per *returned product*, not per UPC queried, and one
+    barcode can legitimately match many ASINs (bundles, variations, or - very
+    common with distributor/closeout inventory - a generic or reused UPC that
+    was never meant to uniquely identify one product). Without a cap, a
+    handful of "junk" barcodes in a batch can each cost 20-30+ tokens instead
+    of 1, which is what silently inflates the total cost of a run. Since this
+    app only ever uses the first returned product for ROI anyway (kp_list[0]
+    at the call site), capping this is pure savings with no loss of the data
+    actually used - the `code-limit` param itself carries no extra token
+    cost. Defaults to 3 rather than 1 so a UPC that matches multiple products
+    can still be flagged as ambiguous in the UI instead of silently picking
+    one.
+
     Returns (results, errors):
       - results: {upc: [product_dict, ...]} - list because one UPC can map to
         multiple ASINs (bundles/variations). Empty list = no Amazon match.
+        len(results[upc]) > 1 is a signal worth surfacing to the user: it
+        means the barcode isn't uniquely tied to one product on Amazon.
       - errors: {upc: error message} for any UPC that failed after retries -
         these are NOT silently dropped, so the caller can show the user
         exactly which products it couldn't check rather than pretending
@@ -141,7 +177,8 @@ def fetch_products_by_upc(api_key: str, upcs: list[str], domain: int = AMAZON_DO
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_upc = {
-            executor.submit(_fetch_one, session, api_key, u, domain): u for u in upcs
+            executor.submit(_fetch_one, session, api_key, u, domain, include_rating, code_limit): u
+            for u in upcs
         }
         for future in concurrent.futures.as_completed(future_to_upc):
             upc = future_to_upc[future]

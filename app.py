@@ -99,13 +99,33 @@ with st.sidebar:
              "price looks like a temporary spike rather than the normal going rate, since ROI calculated "
              "against a spike price often disappears once the price reverts.",
     )
+    include_ratings = st.checkbox(
+        "Include Amazon ratings & reviews", value=False,
+        help="Costs up to +1 extra token per product (only charged when Keepa's cached rating data is "
+             "more than 14 days stale and needs refreshing) - roughly doubles worst-case token cost on "
+             "a large batch. Off by default so routine runs stay near the base ~1 token/product cost; "
+             "turn on for a batch when you specifically want to see ratings.",
+    )
+    code_limit = int(st.number_input(
+        "Max Amazon matches per UPC (code-limit)", value=3, min_value=1, max_value=20, step=1,
+        help="THE MAIN TOKEN-COST LEVER - more impactful than the ratings toggle above. Keepa bills "
+             "1 token per PRODUCT RETURNED, not per UPC you look up. A generic or reused barcode "
+             "(common in distributor/closeout inventory) can match dozens of unrelated ASINs, so one "
+             "UPC lookup can cost 20-30+ tokens instead of 1 - this is what was silently burning "
+             "through tokens fast. This app only ever uses the first match for ROI, so capping the "
+             "number of matches Keepa returns per UPC is free savings with no loss of the data actually "
+             "used. Lower this to 1 to minimize cost, or leave a little room (2-3) to still see when a "
+             "barcode is ambiguous (see the 'Amazon Matches' column in the report).",
+    ))
     min_rating_flag = st.number_input(
         "Flag rating below (stars)", value=3.5, step=0.1, min_value=1.0, max_value=5.0,
+        disabled=not include_ratings,
         help="Informational only - doesn't disqualify anything. Flags products with a low star rating, "
              "or with no rating data at all (too new/low-volume to have one), so you notice before buying.",
     )
     min_reviews_flag = st.number_input(
         "Flag review count below", value=10, step=5, min_value=0,
+        disabled=not include_ratings,
         help="A high star rating built on very few reviews isn't a reliable signal - flags products "
              "under this review count alongside the rating flag.",
     )
@@ -261,10 +281,20 @@ if demo_mode or not keepa_key:
     for u in upcs:
         row = batch_work.loc[batch_work["upc"] == u].iloc[0]
         kp = demo_data.fake_keepa_product(u, row["cost"])
-        keepa_results[u] = [kp] if kp else []  # empty list = "no Amazon match", same shape Keepa returns
+        if not kp:
+            keepa_results[u] = []  # empty list = "no Amazon match", same shape Keepa returns
+        else:
+            # Simulate a shared/reused barcode occasionally matching multiple
+            # products, capped at code_limit just like the real Keepa response
+            # would be - so the "Amazon Matches" / "Ambiguous Match?" columns
+            # have something to show in demo mode too.
+            match_count = min(demo_data.fake_match_count(u), code_limit)
+            keepa_results[u] = [kp] * match_count
 else:
     try:
-        keepa_results, keepa_errors = keepa_client.fetch_products_by_upc(keepa_key, upcs)
+        keepa_results, keepa_errors = keepa_client.fetch_products_by_upc(
+            keepa_key, upcs, include_rating=include_ratings, code_limit=code_limit
+        )
     except keepa_client.KeepaError as e:
         st.error(f"Keepa lookup failed: {e}")
         st.stop()
@@ -324,18 +354,28 @@ for _, r in batch_work.iterrows():
     is_price_spike = (price_vs_avg is not None and price_vs_avg >= spike_threshold)
     rating = kp.get("rating") if kp else None
     review_count = kp.get("review_count") if kp else None
-    rating_concern = kp is not None and (
-        rating is None or rating < min_rating_flag or (review_count or 0) < min_reviews_flag
+    # Only meaningful when ratings were actually requested - otherwise `rating`
+    # is always None because we never asked Keepa for it, which would make
+    # every single row look like a "concern" and defeat the point of the flag.
+    rating_concern = (
+        include_ratings and kp is not None and (
+            rating is None or rating < min_rating_flag or (review_count or 0) < min_reviews_flag
+        )
     )
+    amazon_match_count = len(kp_list)
 
     rows.append({
         "UPC": u,
         "Cost": cost,
         "Price Spike?": ("Yes" if is_price_spike else ("No" if price_vs_avg is not None else None)),
         "Price vs 90-Day Avg %": price_vs_avg,
-        "Amazon Rating": rating,
-        "Amazon Reviews": review_count,
-        "Rating Concern?": ("Yes" if rating_concern else ("No" if kp is not None else None)),
+        "Amazon Rating": rating if include_ratings else None,
+        "Amazon Reviews": review_count if include_ratings else None,
+        "Rating Concern?": (
+            ("Yes" if rating_concern else "No") if (include_ratings and kp is not None) else None
+        ),
+        "Amazon Matches": amazon_match_count,
+        "Ambiguous Match?": ("Yes" if amazon_match_count > 1 else ("No" if kp is not None else None)),
         "Description": r["description"],
         "Case Qty": r["case_qty"],
         "Amazon ASIN": kp.get("asin") if kp else None,
@@ -401,6 +441,8 @@ def _highlight_flags(row):
         styles[list(row.index).index("Price Spike?")] = "background-color: #fff3cd"
     if row.get("Rating Concern?") == "Yes":
         styles[list(row.index).index("Rating Concern?")] = "background-color: #fff3cd"
+    if row.get("Ambiguous Match?") == "Yes":
+        styles[list(row.index).index("Ambiguous Match?")] = "background-color: #ffe9e0"
     return styles
 
 
@@ -445,6 +487,16 @@ if n_rating_concerns:
         f"{n_rating_concerns} product(s) have a low rating, too few reviews to trust the rating, or no "
         f"rating data at all (highlighted) - a great ROI on a poorly-rated listing often means high "
         f"returns/refunds eating the margin, so worth a manual look before buying."
+    )
+
+n_ambiguous = int((results["Ambiguous Match?"] == "Yes").sum())
+if n_ambiguous:
+    st.caption(
+        f"{n_ambiguous} product(s) have a barcode that matched more than one Amazon product "
+        f"(highlighted) - this UPC isn't uniquely tied to one listing, so the 'first match' used for "
+        f"ROI may not be the exact item you have. It's also the main driver of Keepa token cost, since "
+        f"Keepa bills per matched product, not per UPC looked up - lower 'Max Amazon matches per UPC' "
+        f"in the sidebar if this count is high and tokens are running out fast."
     )
 
 if check_ebay:
