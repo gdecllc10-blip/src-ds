@@ -235,8 +235,17 @@ if num_batches > 1:
         f"{'✅ ' if i in completed_batches else ''}Batch {i + 1} of {num_batches} (rows {start + 1}-{end})"
         for i, (start, end) in enumerate(batch_bounds)
     ]
+    # Give the selectbox an explicit, sheet-scoped key so Streamlit keeps
+    # remembering your choice across reruns (e.g. right after "Analyze"
+    # finishes and adds a checkmark) instead of snapping back to Batch 1.
+    # Scoping the key to sheet_id also means a genuinely different sheet
+    # starts fresh at Batch 1 rather than reusing a stale index.
+    batch_selector_key = f"batch_selector_{sheet_id}"
+    if batch_selector_key not in st.session_state:
+        st.session_state[batch_selector_key] = 0
     selected_batch = st.selectbox(
         "Which batch do you want to run now?", range(num_batches), format_func=lambda i: batch_labels[i],
+        key=batch_selector_key,
     )
 
     with st.expander("Prefer to pre-split the whole sheet into separate files instead?"):
@@ -365,8 +374,10 @@ for _, r in batch_work.iterrows():
     amazon_match_count = len(kp_list)
 
     rows.append({
-        "UPC": u,
+        "Amazon Sales Rank": kp.get("sales_rank") if kp else None,
+        "Amazon Price": az["sell_price"] if az else None,
         "Cost": cost,
+        "UPC": u,
         "Price Spike?": ("Yes" if is_price_spike else ("No" if price_vs_avg is not None else None)),
         "Price vs 90-Day Avg %": price_vs_avg,
         "Amazon Rating": rating if include_ratings else None,
@@ -380,8 +391,6 @@ for _, r in batch_work.iterrows():
         "Case Qty": r["case_qty"],
         "Amazon ASIN": kp.get("asin") if kp else None,
         "Amazon Title": kp.get("title") if kp else None,
-        "Amazon Price": az["sell_price"] if az else None,
-        "Amazon Sales Rank": kp.get("sales_rank") if kp else None,
         "Amazon Offers (New)": offer_count,
         "Amazon Sells This?": ("Yes" if amazon_sells_it else ("No" if amazon_sells_it is not None else None)),
         "Amazon ROI %": az["roi_pct"] if az else None,
