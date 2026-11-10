@@ -117,6 +117,13 @@ with st.sidebar:
              "used. Lower this to 1 to minimize cost, or leave a little room (2-3) to still see when a "
              "barcode is ambiguous (see the 'Amazon Matches' column in the report).",
     ))
+    hide_ambiguous = st.checkbox(
+        "Hide ambiguous Amazon matches from results", value=True,
+        help="When a barcode matches more than one Amazon product, the ROI shown for it rests on an "
+             "unreliable 'first match' guess (see the code-limit note above). On, those products are "
+             "removed from the results table and every export entirely. Off, they're kept but flagged "
+             "via the 'Ambiguous Match?' column instead, so you can review them yourself.",
+    )
     min_rating_flag = st.number_input(
         "Flag rating below (stars)", value=3.5, step=0.1, min_value=1.0, max_value=5.0,
         disabled=not include_ratings,
@@ -178,7 +185,7 @@ def _idx(col_name):
 
 
 options = ["(none)"] + cols
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     upc_col = st.selectbox("UPC / EAN column", options, index=_idx(detected["upc"]))
 with c2:
@@ -187,6 +194,11 @@ with c3:
     desc_col = st.selectbox("Description column (optional)", options, index=_idx(detected["description"]))
 with c4:
     qty_col = st.selectbox("Case qty column (optional)", options, index=_idx(detected["qty"]))
+with c5:
+    brand_col = st.selectbox(
+        "Brand column (optional)", options, index=_idx(detected["brand"]),
+        help="Used to list which brands fall in each batch, in the batch dropdown below.",
+    )
 
 if upc_col == "(none)" or cost_col == "(none)":
     st.warning("Select at least a UPC column and a cost column to continue.")
@@ -197,6 +209,7 @@ work["upc"] = df[upc_col].apply(clean_upc)
 work["cost"] = df[cost_col].apply(clean_cost)
 work["description"] = df[desc_col] if desc_col != "(none)" else ""
 work["case_qty"] = df[qty_col] if qty_col != "(none)" else ""
+work["brand"] = df[brand_col].astype(str).str.strip() if brand_col != "(none)" else ""
 work = work[(work["upc"] != "") & work["cost"].notna()].drop_duplicates(subset="upc").reset_index(drop=True)
 
 st.caption(f"{len(work)} valid rows with a UPC and cost detected.")
@@ -229,10 +242,38 @@ num_batches = max(1, math.ceil(total_rows / batch_size))
 batch_bounds = [(i * batch_size, min((i + 1) * batch_size, total_rows)) for i in range(num_batches)]
 completed_batches = st.session_state["batch_results"]
 
+has_brand_col = brand_col != "(none)"
+MAX_BRANDS_SHOWN = 4
+
+
+def _brand_summary(start, end):
+    """Distinct, non-blank brands in this batch's row range, most-frequent
+    first, truncated with a '+N more' tail so the dropdown stays readable."""
+    if not has_brand_col:
+        return ""
+    batch_brands = work["brand"].iloc[start:end]
+    batch_brands = batch_brands[batch_brands.str.strip() != ""]
+    if batch_brands.empty:
+        return ""
+    counts = batch_brands.value_counts()
+    shown = list(counts.index[:MAX_BRANDS_SHOWN])
+    remaining = len(counts) - len(shown)
+    summary = ", ".join(shown)
+    if remaining > 0:
+        summary += f" +{remaining} more"
+    return f" — {summary}"
+
+
 if num_batches > 1:
     st.caption(f"This sheet is split into {num_batches} batches of up to {batch_size} rows each.")
+    if not has_brand_col:
+        st.caption(
+            "Tip: pick a Brand column above (step 1) to see which brands fall in each batch, "
+            "right in the dropdown below."
+        )
     batch_labels = [
-        f"{'✅ ' if i in completed_batches else ''}Batch {i + 1} of {num_batches} (rows {start + 1}-{end})"
+        f"{'✅ ' if i in completed_batches else ''}Batch {i + 1} of {num_batches} "
+        f"(rows {start + 1}-{end}){_brand_summary(start, end)}"
         for i, (start, end) in enumerate(batch_bounds)
     ]
     # Give the selectbox an explicit, sheet-scoped key so Streamlit keeps
@@ -414,10 +455,6 @@ results = pd.DataFrame(rows)
 results = results.sort_values("Best ROI %", ascending=False, na_position="last")
 results.insert(0, "Batch", selected_batch + 1)
 
-# remember this batch's results for the session so a "combined so far"
-# export is possible once you've run more than one batch from this sheet
-st.session_state["batch_results"][selected_batch] = results
-
 # Sanity check: the same Amazon ASIN showing up against many different UPCs
 # in one run is a red flag, not a coincidence - it's the exact signature of
 # a UPC-to-product mismatch bug (see keepa_client.py docstring for the one
@@ -434,6 +471,16 @@ if not suspicious_asins.empty:
     for asin, count in suspicious_asins.items():
         sample_title = results.loc[results["Amazon ASIN"] == asin, "Amazon Title"].iloc[0]
         st.write(f"- **{asin}** (\"{sample_title}\") matched to {count} different UPCs")
+
+# Ambiguous-match removal happens after the ASIN safety-net check above (which
+# stays most useful looking at the full, unfiltered set) but before anything
+# else touches `results`, so the filter applies everywhere downstream:
+# the results table, every export, and the combined-batches file.
+n_ambiguous_total = int((results["Ambiguous Match?"] == "Yes").sum())
+if hide_ambiguous:
+    results = results[results["Ambiguous Match?"] != "Yes"].reset_index(drop=True)
+
+st.session_state["batch_results"][selected_batch] = results
 
 st.subheader("4. Results")
 n_buys = int(results["Meets Threshold"].sum())
@@ -498,15 +545,26 @@ if n_rating_concerns:
         f"returns/refunds eating the margin, so worth a manual look before buying."
     )
 
-n_ambiguous = int((results["Ambiguous Match?"] == "Yes").sum())
-if n_ambiguous:
-    st.caption(
-        f"{n_ambiguous} product(s) have a barcode that matched more than one Amazon product "
-        f"(highlighted) - this UPC isn't uniquely tied to one listing, so the 'first match' used for "
-        f"ROI may not be the exact item you have. It's also the main driver of Keepa token cost, since "
-        f"Keepa bills per matched product, not per UPC looked up - lower 'Max Amazon matches per UPC' "
-        f"in the sidebar if this count is high and tokens are running out fast."
-    )
+if hide_ambiguous:
+    if n_ambiguous_total:
+        st.caption(
+            f"{n_ambiguous_total} product(s) were removed from these results (and every export/combined "
+            f"file) because their barcode matched more than one Amazon product - the 'first match' used "
+            f"for ROI wouldn't necessarily be the exact item you have. It's also the main driver of Keepa "
+            f"token cost, since Keepa bills per matched product, not per UPC looked up - lower 'Max Amazon "
+            f"matches per UPC' in the sidebar if tokens are running out fast. Uncheck 'Hide ambiguous "
+            f"Amazon matches' in the sidebar to see these instead (flagged, not removed)."
+        )
+else:
+    n_ambiguous = int((results["Ambiguous Match?"] == "Yes").sum())
+    if n_ambiguous:
+        st.caption(
+            f"{n_ambiguous} product(s) have a barcode that matched more than one Amazon product "
+            f"(highlighted) - this UPC isn't uniquely tied to one listing, so the 'first match' used for "
+            f"ROI may not be the exact item you have. It's also the main driver of Keepa token cost, since "
+            f"Keepa bills per matched product, not per UPC looked up - lower 'Max Amazon matches per UPC' "
+            f"in the sidebar if this count is high and tokens are running out fast."
+        )
 
 if check_ebay:
     st.caption(
@@ -530,8 +588,105 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
 
+# ---------------------------------------------------------------------------
+# Save items - a lightweight way to bookmark specific products to come back
+# to later (re-source the same item, watch a price, build a short list),
+# without needing any real backend. Saved items live in st.session_state for
+# this browser session; "download, re-upload next time" is the persistence
+# mechanism since Streamlit Community Cloud apps don't keep a durable
+# filesystem of their own across restarts/redeploys.
+# ---------------------------------------------------------------------------
+st.subheader("5. Save items for future reference")
+st.caption(
+    "Bookmark products you want to come back to - re-sourcing the same item later, watching a "
+    "price, or building a short list. Pick items below, then download the Saved Items file at the "
+    "bottom; re-upload that same file next time to keep adding to it instead of starting over."
+)
+
+if "saved_items" not in st.session_state:
+    st.session_state["saved_items"] = {}  # upc -> row dict
+
+saved_upload = st.file_uploader(
+    "Load a previous Saved Items file (optional)", type=["xlsx"], key="saved_items_uploader",
+    help="Re-upload the 'saved_items.xlsx' you downloaded last time so new picks get added to it "
+         "instead of replacing it.",
+)
+if saved_upload is not None:
+    load_key = f"saved_loaded_{saved_upload.name}_{saved_upload.size}"
+    if not st.session_state.get(load_key):
+        try:
+            # dtype=str is load-bearing: without it, pandas auto-infers a
+            # digit-only UPC column as a number on read-back and silently
+            # drops any leading zero (e.g. "00222" -> 222), even though the
+            # cell itself is stored correctly as text in the .xlsx file.
+            prev_saved = pd.read_excel(saved_upload, dtype={"UPC": str})
+            loaded = 0
+            for _, prev_row in prev_saved.iterrows():
+                prev_upc = str(prev_row.get("UPC", "")).strip()
+                if prev_upc and prev_upc.lower() != "nan":
+                    st.session_state["saved_items"][prev_upc] = prev_row.to_dict()
+                    loaded += 1
+            st.session_state[load_key] = True
+            if loaded:
+                st.success(f"Loaded {loaded} previously saved item(s) - now {len(st.session_state['saved_items'])} total.")
+        except Exception as e:
+            st.error(f"Couldn't read that file - is it a Saved Items export from this app? ({e})")
+
+save_options = display_df["UPC"].tolist()
+
+
+def _save_label(u):
+    row = display_df.loc[display_df["UPC"] == u].iloc[0]
+    desc = str(row.get("Description") or "")[:40]
+    roi = row.get("Best ROI %")
+    roi_str = f"{roi:.0f}% ROI" if pd.notna(roi) else "no ROI"
+    tag = " [already saved]" if u in st.session_state["saved_items"] else ""
+    return f"{u} - {desc} - {roi_str}{tag}" if desc else f"{u} - {roi_str}{tag}"
+
+
+to_save = st.multiselect(
+    "Pick items from this batch's results (above) to save", save_options, format_func=_save_label,
+)
+if st.button("Add selected to Saved Items", disabled=not to_save):
+    saved_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
+    for u in to_save:
+        save_row = display_df.loc[display_df["UPC"] == u].iloc[0].to_dict()
+        save_row["Date Saved"] = saved_at
+        st.session_state["saved_items"][u] = save_row
+    st.success(f"Added {len(to_save)} item(s) - {len(st.session_state['saved_items'])} saved in total now.")
+
+n_saved = len(st.session_state["saved_items"])
+if n_saved:
+    saved_df = pd.DataFrame(list(st.session_state["saved_items"].values()))
+    lead_cols = [c for c in
+                 ["UPC", "Description", "Date Saved", "Cost", "Amazon Price", "Best Channel", "Best ROI %"]
+                 if c in saved_df.columns]
+    saved_df = saved_df[lead_cols + [c for c in saved_df.columns if c not in lead_cols]]
+    saved_df = saved_df.sort_values("Date Saved", ascending=False) if "Date Saved" in saved_df.columns else saved_df
+
+    st.write(f"**{n_saved} item(s) saved this session:**")
+    st.dataframe(saved_df, use_container_width=True, height=min(300, 60 + 35 * n_saved))
+
+    saved_buf = io.BytesIO()
+    with pd.ExcelWriter(saved_buf, engine="openpyxl") as writer:
+        saved_df.to_excel(writer, index=False, sheet_name="Saved Items")
+
+    dl_col, clear_col = st.columns([3, 1])
+    with dl_col:
+        st.download_button(
+            f"Download Saved Items ({n_saved})", data=saved_buf.getvalue(),
+            file_name="saved_items.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with clear_col:
+        if st.button("Clear saved items"):
+            st.session_state["saved_items"] = {}
+            st.rerun()
+else:
+    st.caption("No items saved yet this session.")
+
 if num_batches > 1:
-    st.subheader("5. Combined results across batches")
+    st.subheader("6. Combined results across batches")
     n_completed = len(st.session_state["batch_results"])
     st.caption(f"{n_completed} of {num_batches} batches analyzed so far this session.")
     if n_completed > 1:
