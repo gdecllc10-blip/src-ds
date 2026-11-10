@@ -29,6 +29,9 @@ DESC_HEADER_HINTS = [
 QTY_HEADER_HINTS = [
     "qty", "quantity", "case pack", "pack", "case qty", "units",
 ]
+BRAND_HEADER_HINTS = [
+    "brand", "brand name", "manufacturer", "mfg", "vendor", "make",
+]
 
 
 def _norm(s: str) -> str:
@@ -108,6 +111,7 @@ def detect_columns(df: pd.DataFrame) -> dict:
         "cost": _best_header_match(cols, COST_HEADER_HINTS),
         "description": _best_header_match(cols, DESC_HEADER_HINTS),
         "qty": _best_header_match(cols, QTY_HEADER_HINTS),
+        "brand": _best_header_match(cols, BRAND_HEADER_HINTS),
     }
 
     # content-sniffing fallback for upc/cost if header match failed
